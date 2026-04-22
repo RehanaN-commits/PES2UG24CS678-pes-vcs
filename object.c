@@ -94,10 +94,75 @@ int object_exists(const ObjectID *id) {
 //
 // Returns 0 on success, -1 on error.
 int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out) {
-    // TODO: Implement
-    (void)type; (void)data; (void)len; (void)id_out;
-    return -1;
-}
+    // STEP 1: Create header
+    char header[64];
+    const char *type_str =
+        (type == OBJ_BLOB) ? "blob" :
+        (type == OBJ_TREE) ? "tree" : "commit";
+
+    int header_len = snprintf(header, sizeof(header), "%s %zu", type_str, len);
+    header[header_len] = '\0';
+    header_len += 1; // include null byte
+
+    // STEP 2: Combine header + data
+    size_t total_len = header_len + len;
+    unsigned char *full = malloc(total_len);
+    if (!full) return -1;
+
+    memcpy(full, header, header_len);
+    memcpy(full + header_len, data, len);
+
+    // STEP 3: Compute hash
+    compute_hash(full, total_len, id_out);
+
+    // STEP 4: Deduplication
+    if (object_exists(id_out)) {
+        free(full);
+        return 0;
+    }
+
+    // STEP 5: Get object path
+    char path[512];
+    object_path(id_out, path, sizeof(path));
+
+    // STEP 6: Create directory (.pes/objects/XX)
+    char dir[512];
+    strncpy(dir, path, sizeof(dir));
+    char *slash = strrchr(dir, '/');
+    if (slash) *slash = '\0';
+
+    mkdir(dir, 0755);
+
+    // STEP 7: Write to temp file
+    char temp_path[512];
+    snprintf(temp_path, sizeof(temp_path), "%.*s.tmp",
+         (int)(sizeof(temp_path) - 5), path);
+
+    int fd = open(temp_path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (fd < 0) {
+        free(full);
+        return -1;
+    }
+
+    if (write(fd, full, total_len) != (ssize_t)total_len) {
+        close(fd);
+        free(full);
+        return -1;
+    }
+
+    fsync(fd);
+    close(fd);
+
+    // STEP 8: Atomic rename
+    if (rename(temp_path, path) != 0) {
+        free(full);
+        return -1;
+    }
+
+    // STEP 9: Cleanup
+    free(full);
+    return 0;
+} 
 
 // Read an object from the store.
 //
@@ -122,7 +187,83 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
 // The caller is responsible for calling free(*data_out).
 // Returns 0 on success, -1 on error (file not found, corrupt, etc.).
 int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_t *len_out) {
-    // TODO: Implement
-    (void)id; (void)type_out; (void)data_out; (void)len_out;
-    return -1;
+    // STEP 1: Get file path
+    char path[512];
+    object_path(id, path, sizeof(path));
+
+    // STEP 2: Open file
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return -1;
+
+    // STEP 3: Read entire file
+    fseek(fp, 0, SEEK_END);
+    long size = ftell(fp);
+    rewind(fp);
+
+    if (size <= 0) {
+        fclose(fp);
+        return -1;
+    }
+
+    unsigned char *buffer = malloc(size);
+    if (!buffer) {
+        fclose(fp);
+        return -1;
+    }
+
+    if (fread(buffer, 1, size, fp) != (size_t)size) {
+        free(buffer);
+        fclose(fp);
+        return -1;
+    }
+
+    fclose(fp);
+
+    // STEP 4: Find header end (\0)
+    unsigned char *null_pos = memchr(buffer, '\0', size);
+    if (!null_pos) {
+        free(buffer);
+        return -1;
+    }
+
+    // STEP 5: Parse type
+    if (strncmp((char *)buffer, "blob", 4) == 0)
+        *type_out = OBJ_BLOB;
+    else if (strncmp((char *)buffer, "tree", 4) == 0)
+        *type_out = OBJ_TREE;
+    else if (strncmp((char *)buffer, "commit", 6) == 0)
+        *type_out = OBJ_COMMIT;
+    else {
+        free(buffer);
+        return -1;
+    }
+
+    // STEP 6: Extract data
+    size_t header_len = (null_pos - buffer) + 1;
+    size_t data_len = size - header_len;
+
+    void *data = malloc(data_len);
+    if (!data) {
+        free(buffer);
+        return -1;
+    }
+
+    memcpy(data, buffer + header_len, data_len);
+
+    // STEP 7: Verify hash (integrity check)
+    ObjectID check_id;
+    compute_hash(buffer, size, &check_id);
+
+    if (memcmp(&check_id, id, sizeof(ObjectID)) != 0) {
+        free(buffer);
+        free(data);
+        return -1;
+    }
+
+    // STEP 8: Return values
+    *data_out = data;
+    *len_out = data_len;
+
+    free(buffer);
+    return 0;
 }

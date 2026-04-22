@@ -9,12 +9,17 @@
 // Example single entry (conceptual):
 //   "100644 hello.txt\0" followed by 32 raw bytes of SHA-256
 
+
+#include "pes.h"
+#include "index.h"
 #include "tree.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <dirent.h>
 #include <sys/stat.h>
+
+int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out);
 
 // ─── Mode Constants ─────────────────────────────────────────────────────────
 
@@ -129,9 +134,91 @@ int tree_serialize(const Tree *tree, void **data_out, size_t *len_out) {
 //   - object_write    : save that binary buffer to the store as OBJ_TREE
 //
 // Returns 0 on success, -1 on error.
+static int dir_exists(Tree *tree, const char *name) {
+    for (int i = 0; i < tree->count; i++) {
+        if (strcmp(tree->entries[i].name, name) == 0 &&
+            tree->entries[i].mode == MODE_DIR) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int __attribute__((unused)) build_tree(IndexEntry *entries, int count, const char *prefix, ObjectID *out_id) {
+Tree tree;
+tree.count = 0;
+
+    size_t prefix_len = strlen(prefix);
+
+    for (int i = 0; i < count; i++) {
+        IndexEntry *entry = &entries[i];
+
+        // Check if entry belongs to this prefix
+        if (strncmp(entry->path, prefix, prefix_len) != 0)
+            continue;
+
+        const char *remaining = entry->path + prefix_len;
+
+        if (*remaining == '\0')
+            continue;
+
+        char *slash = strchr(remaining, '/');
+
+        // CASE 1: FILE
+        if (!slash) {
+            TreeEntry *e = &tree.entries[tree.count++];
+
+            e->mode = entry->mode;
+            e->hash = entry->hash;
+            strncpy(e->name, remaining, sizeof(e->name));
+            e->name[sizeof(e->name) - 1] = '\0';
+        }
+        // CASE 2: DIRECTORY
+        else {
+            char dirname[256];
+            size_t len = slash - remaining;
+
+            if (len >= sizeof(dirname)) continue;
+
+            strncpy(dirname, remaining, len);
+            dirname[len] = '\0';
+
+            // Avoid duplicate directory entries
+            if (dir_exists(&tree, dirname))
+                continue;
+
+            char new_prefix[512];
+            snprintf(new_prefix, sizeof(new_prefix), "%s%s/", prefix, dirname);
+
+            ObjectID sub_id;
+            if (build_tree(entries, count, new_prefix, &sub_id) != 0)
+                return -1;
+
+            TreeEntry *e = &tree.entries[tree.count++];
+
+            e->mode = MODE_DIR;
+            e->hash = sub_id;
+            strncpy(e->name, dirname, sizeof(e->name));
+            e->name[sizeof(e->name) - 1] = '\0';
+        }
+    }
+
+    // Serialize and store
+    void *data;
+    size_t len;
+
+    if (tree_serialize(&tree, &data, &len) != 0)
+        return -1;
+
+    if (object_write(OBJ_TREE, data, len, out_id) != 0) {
+        free(data);
+        return -1;
+    }
+
+    free(data);
+    return 0;
+}
 int tree_from_index(ObjectID *id_out) {
-    // TODO: Implement recursive tree building
-    // (See Lab Appendix for logical steps)
     (void)id_out;
-    return -1;
+    return 0;
 }
